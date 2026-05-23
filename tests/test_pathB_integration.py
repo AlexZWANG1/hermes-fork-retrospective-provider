@@ -1,290 +1,316 @@
-"""集成测试 · 验证路 B 三处改动联动.
+"""Path B 改造集成测试 · 双层架构.
 
-测试场景:
-  1. RetrospectiveProvider 抽象 (改动 1) · 能正确创建子类
-  2. MemoryManager.run_retrospective (改动 2) · 能调度 provider
-  3. 主循环触发逻辑 (改动 3) · message_loader 注入正确
-  4. Habit Reflector plugin · 整套链路跑通
+跑法:
+  cd hermes-fork-pathB
+  export PYTHONPATH="$PWD:$HOME/.hermes/hermes-agent"
+  python3 tests/test_pathB_integration.py
 
-注意: 这里我们没法跑真 Hermes (太大), 用 mock 验证接口契约和数据流.
+不调真 API · 全部用 dry_run mode + 合成 fixture.
 """
+
 from __future__ import annotations
-import sys
+
 import json
+import sys
+import tempfile
+import time
+import uuid
 from pathlib import Path
-from unittest.mock import MagicMock
 
-# 把 fork 的 agent/ 加进 import path
-FORK_ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(FORK_ROOT))
+_HERE = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_HERE))
 
 
-def test_change1_retrospective_provider_subclass_works():
-    """改动 1 · 能创建 RetrospectiveProvider 子类."""
-    from agent.memory_provider import RetrospectiveProvider, Schedule, Claim, PromotionResult
+# ═════════════════════════════════════════════════════════════════════════════
+# Test fixtures
+# ═════════════════════════════════════════════════════════════════════════════
 
-    # 子类化测试
-    class FakeProvider(RetrospectiveProvider):
-        name = "fake"
+def _make_episode(session_id: str, turn_n: int, user_text: str, assistant_text: str = "ok"):
+    from agent.memory_provider import Episode
+    return Episode(
+        episode_id=f"ep_{uuid.uuid4().hex[:8]}",
+        session_id=session_id,
+        turn_n=turn_n,
+        timestamp=time.time() - (60 - turn_n) * 3600,
+        user_content=user_text,
+        assistant_content=assistant_text,
+    )
 
+
+def _make_60_episodes():
+    episodes = []
+    for i in range(60):
+        sess = f"s_2026_05_{i // 8:02d}"
+        if i % 4 == 0:
+            text = "用表格列出 SWE-bench Pro 方法学对比"
+        elif i % 5 == 0:
+            text = "请给我 markdown table 格式"
+        else:
+            text = f"普通问题 {i}"
+        episodes.append(_make_episode(sess, i % 8 + 1, text))
+    return episodes
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Test 1 · Layer A 抽象
+# ═════════════════════════════════════════════════════════════════════════════
+
+def test_episodic_provider_subclass_works():
+    from agent.memory_provider import EpisodicProvider, Episode
+
+    class FakeEpisodic(EpisodicProvider):
+        @property
+        def name(self): return "fake"
         def is_available(self): return True
-        def initialize(self, **kw): pass
-        def system_prompt_block(self): return ""
-        def prefetch(self, q, **kw): return ""
-        def sync_turn(self, u, a, **kw): pass
         def get_tool_schemas(self): return []
-        def handle_tool_call(self, n, a, **kw): return ""
-        def shutdown(self): pass
+        def handle_tool_call(self, *a, **k): return "{}"
+        def initialize(self, *a, **k): self._store = []
+        def record(self, ep): self._store.append(ep)
+        def retrieve(self, query, *, top_k=5, session_id=None):
+            return [e for e in self._store if query in e.user_content][:top_k]
 
-        def schedule(self):
-            return Schedule(interval_hours=24, min_idle_hours=1.0)
-
-        def analyze(self, messages, *, window_days=30):
-            return [
-                Claim(
-                    claim="测试 claim",
-                    classification="preference",
-                    evidence=[
-                        {"session_id": "s1", "turn_n": 1, "excerpt": "test"},
-                        {"session_id": "s2", "turn_n": 2, "excerpt": "test"},
-                        {"session_id": "s3", "turn_n": 3, "excerpt": "test"},
-                    ],
-                    confidence=0.9,
-                    decay_at="2026-12-31",
-                )
-            ]
-
-        def promote(self, claims):
-            return PromotionResult(promoted_to_usermd=len(claims))
-
-    p = FakeProvider()
-    assert p.is_available()
-    assert p.schedule().interval_hours == 24
-
-    claims = p.analyze([], window_days=30)
-    assert len(claims) == 1
-    assert claims[0].confidence == 0.9
-
-    result = p.promote(claims)
-    assert result.promoted_to_usermd == 1
+    fake = FakeEpisodic()
+    fake.initialize()
+    fake.record(_make_episode("s1", 1, "用表格 abc"))
+    fake.record(_make_episode("s1", 2, "无关消息"))
+    results = fake.retrieve("表格")
+    assert len(results) == 1
+    assert "表格" in results[0].user_content
+    print("  ✓ test_episodic_provider_subclass_works               [Layer A 抽象能用]")
 
 
-def test_change2_memory_manager_runs_retrospective():
-    """改动 2 · MemoryManager.run_retrospective 能找到并调度 Provider."""
-    from agent.memory_manager import MemoryManager
-    from agent.memory_provider import RetrospectiveProvider, Schedule, Claim, PromotionResult
+# ═════════════════════════════════════════════════════════════════════════════
+# Test 2 · Layer B 抽象
+# ═════════════════════════════════════════════════════════════════════════════
 
-    # Mock provider
-    class TestProvider(RetrospectiveProvider):
-        name = "test"
-        analyze_called = False
-        promote_called = False
+def test_actionable_habit_provider_subclass_works():
+    from agent.memory_provider import (
+        ActionableHabitProvider, HabitCandidate, FitnessReport, Schedule,
+    )
 
+    class FakeHabit(ActionableHabitProvider):
+        @property
+        def name(self): return "fake_habit"
         def is_available(self): return True
-        def initialize(self, **kw): pass
-        def system_prompt_block(self): return ""
-        def prefetch(self, q, **kw): return ""
-        def sync_turn(self, u, a, **kw): pass
+        @property
+        def schedule(self): return Schedule()
         def get_tool_schemas(self): return []
-        def handle_tool_call(self, n, a, **kw): return ""
-        def shutdown(self): pass
-
-        def schedule(self): return Schedule(interval_hours=24, min_idle_hours=1.0)
-
-        def analyze(self, messages, *, window_days=30):
-            self.analyze_called = True
-            assert len(messages) >= 10, "manager 应该过滤掉 <10 msg 的情况"
-            return [Claim(
-                claim="x", classification="preference",
-                evidence=[{"session_id": f"s{i}", "turn_n": i, "excerpt": "y"} for i in range(3)],
-                confidence=0.9, decay_at="2026-12-31",
+        def handle_tool_call(self, *a, **k): return "{}"
+        def initialize(self, *a, **k): self._promoted = []
+        def propose_habit(self, episodes):
+            return [HabitCandidate(
+                candidate_id="hc_1", claim="use tables", classification="style",
+                supporting_episodes=[e.episode_id for e in episodes[:3]],
+                raw_confidence=0.9, proposed_at="2026-05-23",
             )]
+        def fitness_test(self, c, qs):
+            return FitnessReport(candidate_id=c.candidate_id, win_rate_B=0.8,
+                                 verdict="pass", n_samples=len(qs))
+        def await_user_approval(self, c): return True
+        def promote(self, c): self._promoted.append(c.candidate_id)
+        def revert(self, cid): self._promoted.remove(cid)
 
-        def promote(self, claims):
-            self.promote_called = True
-            return PromotionResult(promoted_to_usermd=len(claims))
-
-    manager = MemoryManager()
-    provider = TestProvider()
-    manager.add_provider(provider)
-
-    # ★ 改动 2 的核心 API
-    result = manager.run_retrospective(
-        trigger="test",
-        message_loader=lambda window_days=30: [
-            {"session_id": "s", "role": "user", "content": "hi", "turn_n": i, "timestamp": 0}
-            for i in range(20)
-        ],
-    )
-
-    assert provider.analyze_called, "analyze 没被调到"
-    assert provider.promote_called, "promote 没被调到"
-    assert len(result["ran"]) == 1
-    assert len(result["errors"]) == 0
+    h = FakeHabit()
+    h.initialize()
+    candidates = h.propose_habit(_make_60_episodes())
+    assert len(candidates) == 1
+    print("  ✓ test_actionable_habit_provider_subclass_works       [Layer B 抽象能用]")
 
 
-def test_change2_skips_when_few_messages():
-    """改动 2 · 少于 10 条 message 时跳过."""
-    from agent.memory_manager import MemoryManager
-    from agent.memory_provider import RetrospectiveProvider, Schedule, Claim, PromotionResult
+# ═════════════════════════════════════════════════════════════════════════════
+# Test 3 · episodic_store plugin 全链路
+# ═════════════════════════════════════════════════════════════════════════════
 
-    class TestProvider(RetrospectiveProvider):
-        name = "test"
-        analyze_called = False
+def test_episodic_store_plugin_record_retrieve():
+    from plugins.memory.episodic_store import EpisodicStore
 
-        def is_available(self): return True
-        def initialize(self, **kw): pass
-        def system_prompt_block(self): return ""
-        def prefetch(self, q, **kw): return ""
-        def sync_turn(self, u, a, **kw): pass
-        def get_tool_schemas(self): return []
-        def handle_tool_call(self, n, a, **kw): return ""
-        def shutdown(self): pass
-
-        def schedule(self): return Schedule()
-        def analyze(self, messages, **kw):
-            self.analyze_called = True
-            return []
-        def promote(self, claims): return PromotionResult()
-
-    manager = MemoryManager()
-    p = TestProvider()
-    manager.add_provider(p)
-
-    result = manager.run_retrospective(
-        trigger="test",
-        message_loader=lambda window_days=30: [{"session_id": "s"}],  # 只 1 条
-    )
-
-    assert not p.analyze_called, "<10 messages 时应该跳过 analyze"
-    assert len(result["skipped"]) == 1
-    assert "too few messages" in result["skipped"][0]["reason"]
-
-
-def test_change2_handles_provider_errors_gracefully():
-    """改动 2 · provider 抛错时 manager 不崩."""
-    from agent.memory_manager import MemoryManager
-    from agent.memory_provider import RetrospectiveProvider, Schedule, Claim, PromotionResult
-
-    class BrokenProvider(RetrospectiveProvider):
-        name = "broken"
-
-        def is_available(self): return True
-        def initialize(self, **kw): pass
-        def system_prompt_block(self): return ""
-        def prefetch(self, q, **kw): return ""
-        def sync_turn(self, u, a, **kw): pass
-        def get_tool_schemas(self): return []
-        def handle_tool_call(self, n, a, **kw): return ""
-        def shutdown(self): pass
-
-        def schedule(self): return Schedule()
-        def analyze(self, messages, **kw):
-            raise RuntimeError("intentional test failure")
-        def promote(self, claims): return PromotionResult()
-
-    manager = MemoryManager()
-    manager.add_provider(BrokenProvider())
-
-    # 不应抛出, 应记录到 errors
-    result = manager.run_retrospective(
-        trigger="test",
-        message_loader=lambda window_days=30: [{"session_id": "s"} for _ in range(20)],
-    )
-
-    assert len(result["errors"]) == 1
-    assert result["errors"][0]["stage"] == "analyze"
-
-
-def test_habit_reflector_plugin_end_to_end_dryrun():
-    """整套链路 · habit_reflector plugin 跑 dry-run 跑通."""
-    from agent.memory_manager import MemoryManager
-    from plugins.memory.habit_reflector import HabitReflector
-
-    manager = MemoryManager()
-    reflector = HabitReflector()
-    reflector._dry_run = True       # 用 canned response 不调真 API
-
-    # Mock memory_manager 的 handle_tool_call (因为没真 memory_tool)
-    write_calls = []
-    def mock_handle_tool_call(name, args, **kw):
-        write_calls.append({"name": name, "args": args})
-        return json.dumps({"success": True})
-    manager.handle_tool_call = mock_handle_tool_call
-
-    manager.add_provider(reflector)
-
-    # 模拟 initialize (manager 通常会调)
-    import tempfile
-    from datetime import datetime, timezone, timedelta
     with tempfile.TemporaryDirectory() as tmp:
-        reflector.initialize("session_test_001",
-                              hermes_home=tmp,
-                              memory_manager=manager)
+        store = EpisodicStore()
+        store.initialize(hermes_home=tmp)
 
-        # 跳过 cold-start guard: 把 installed_at 设到 8 天前
-        state_file = Path(tmp) / "habit_memory" / ".state.json"
-        eight_days_ago = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
-        state_file.write_text(json.dumps({"installed_at": eight_days_ago}))
+        for i in range(5):
+            store.record(_make_episode(
+                "s_2026", i, f"用表格列 {i}" if i % 2 == 0 else f"无关 {i}",
+            ))
 
-        # ★ 路 B 完整链路 · 主循环触发 → manager 调度 → reflector 分析 → 写 USER.md
-        # force=True 跳过 allowed_hour_range 检查 (测试在白天跑也要能通过)
-        result = manager.run_retrospective(
-            trigger="conversation_start",
-            force=True,
-            message_loader=lambda window_days=30: _fake_messages(60),  # ≥50 才过阈值
+        results = store.retrieve("表格", top_k=10)
+        assert len(results) == 3, f"expected 3 hits, got {len(results)}"
+
+        first_id = results[0].episode_id
+        store.pin(first_id)
+        results2 = store.retrieve("表格", top_k=10)
+        assert results2[0].episode_id == first_id
+
+    print("  ✓ test_episodic_store_plugin_record_retrieve          [Layer A 插件链路]")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Test 4 · fitness gate 拒绝
+# ═════════════════════════════════════════════════════════════════════════════
+
+def test_habit_promoter_fitness_gate_rejects_weak_candidate():
+    from agent.memory_manager import MemoryManager
+    from agent.memory_provider import HabitCandidate, FitnessReport
+    from plugins.memory.habit_promoter import HabitPromoter
+
+    write_log = []
+    manager = MemoryManager()
+    manager.handle_tool_call = lambda n, a, **kw: (write_log.append(a), "{}")[1]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        promoter = HabitPromoter()
+        manager.add_provider(promoter)
+        promoter.initialize(
+            hermes_home=tmp, memory_manager=manager, dry_run=True,
+            promotion_require_user_approval=False,
         )
 
-        assert len(result["errors"]) == 0, f"errors: {result['errors']}"
-        assert len(result["ran"]) == 1
-        run_info = result["ran"][0]
-        assert run_info["name"] == "habit_reflector"
-        # canned response 有 2 条 claims, 都满足 ≥0.85, 都应该 promote 成功
-        assert run_info["result"].promoted_to_usermd >= 1
-        # 应有至少 1 个 skill candidate (canned 里那条 habit)
-        assert run_info["result"].skill_candidates >= 1
+        weak = HabitCandidate(
+            candidate_id="hc_weak", claim="weak rule", classification="style",
+            supporting_episodes=["ep1"], raw_confidence=0.4,
+            proposed_at="2026-05-23",
+        )
+        promoter.fitness_test = lambda c, qs: FitnessReport(
+            candidate_id=c.candidate_id, win_rate_B=0.3,
+            verdict="fail", n_samples=8,
+        )
 
-        # 验证 memory_manager.handle_tool_call 被调过 (≥1 次 memory_write)
-        assert len(write_calls) >= 1
-        assert any(c["name"] == "memory_write" for c in write_calls)
-        assert any(c["args"]["target"] == "user" for c in write_calls)
+        report = manager.run_habit_promotion_pipeline(
+            weak, provider=promoter, sample_queries=["q1", "q2"],
+            require_user_approval=False,
+        )
+
+        assert report["decision"].startswith("rejected_fitness"), \
+            f"expected rejection, got {report['decision']}"
+        assert len(write_log) == 0
+
+    print("  ✓ test_habit_promoter_fitness_gate_rejects_weak       [fitness 防漂移]")
 
 
-def _fake_messages(n: int) -> list:
-    """生成 n 条假 messages."""
-    return [
-        {
-            "session_id": f"s_{i // 4:03d}",   # 每 4 条一个 session
-            "role": "user" if i % 2 == 0 else "assistant",
-            "content": f"测试内容 #{i}",
-            "turn_n": (i % 4) + 1,
-            "timestamp": 1748000000 + i * 60,
-        }
-        for i in range(n)
-    ]
+# ═════════════════════════════════════════════════════════════════════════════
+# Test 5 · 人审 gate 阻挡 silent promote
+# ═════════════════════════════════════════════════════════════════════════════
 
+def test_habit_promoter_user_approval_gate_blocks_silent_promote():
+    from agent.memory_manager import MemoryManager
+    from agent.memory_provider import HabitCandidate
+    from plugins.memory.habit_promoter import HabitPromoter
+
+    write_log = []
+    manager = MemoryManager()
+    manager.handle_tool_call = lambda n, a, **kw: (write_log.append(a), "{}")[1]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        promoter = HabitPromoter()
+        manager.add_provider(promoter)
+        promoter.initialize(hermes_home=tmp, memory_manager=manager, dry_run=True)
+
+        cand = HabitCandidate(
+            candidate_id="hc_good", claim="use tables", classification="style",
+            supporting_episodes=["ep1", "ep2"], raw_confidence=0.92,
+            proposed_at="2026-05-23",
+            intervention="use markdown table for comparisons",
+        )
+
+        promoter.await_user_approval = lambda c: False
+
+        report = manager.run_habit_promotion_pipeline(
+            cand, provider=promoter, sample_queries=["q1"] * 8,
+            require_user_approval=True,
+        )
+
+        assert report["decision"] == "rejected_user_declined"
+        assert len(write_log) == 0
+
+    print("  ✓ test_habit_promoter_user_approval_gate_blocks       [人审防漂移]")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Test 6 · 全链路绿灯
+# ═════════════════════════════════════════════════════════════════════════════
+
+def test_habit_promoter_full_pipeline_promotes_when_approved():
+    from agent.memory_manager import MemoryManager
+    from agent.memory_provider import HabitCandidate
+    from plugins.memory.habit_promoter import HabitPromoter
+
+    write_log = []
+    manager = MemoryManager()
+    manager.handle_tool_call = lambda n, a, **kw: (write_log.append(a), "{}")[1]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        promoter = HabitPromoter()
+        manager.add_provider(promoter)
+        promoter.initialize(hermes_home=tmp, memory_manager=manager, dry_run=True)
+
+        cand = HabitCandidate(
+            candidate_id="hc_full", claim="use tables", classification="style",
+            supporting_episodes=["ep1", "ep2", "ep3"], raw_confidence=0.92,
+            proposed_at="2026-05-23",
+            intervention="use markdown table for comparisons",
+        )
+        promoter.await_user_approval = lambda c: True
+
+        report = manager.run_habit_promotion_pipeline(
+            cand, provider=promoter, sample_queries=["q1"] * 8,
+            require_user_approval=True,
+        )
+
+        assert report["decision"] == "promoted", f"got {report['decision']}"
+        assert len(write_log) == 1
+        assert "table" in write_log[0]["content"].lower()
+
+        audit = (Path(tmp) / "habit_memory" / "audit.log").read_text()
+        assert "promoted" in audit
+        assert "hc_full" in audit
+
+    print("  ✓ test_habit_promoter_full_pipeline_promotes_when_ok  [全链路绿灯]")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Test 7 · propose_habit 蒸馏
+# ═════════════════════════════════════════════════════════════════════════════
+
+def test_propose_habit_distills_candidates():
+    from plugins.memory.habit_promoter import HabitPromoter
+
+    with tempfile.TemporaryDirectory() as tmp:
+        promoter = HabitPromoter()
+        promoter.initialize(hermes_home=tmp, dry_run=True)
+
+        episodes = _make_60_episodes()
+        candidates = promoter.propose_habit(episodes)
+
+        assert len(candidates) == 1
+        assert "结构化" in candidates[0].claim or "table" in candidates[0].claim.lower()
+        assert candidates[0].raw_confidence > 0.8
+
+    print("  ✓ test_propose_habit_distills_candidates              [蒸馏链路]")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Runner
+# ═════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    """直接 python -m tests.test_pathB_integration 跑."""
-    import traceback
     tests = [
-        ("test_change1_retrospective_provider_subclass_works", test_change1_retrospective_provider_subclass_works),
-        ("test_change2_memory_manager_runs_retrospective", test_change2_memory_manager_runs_retrospective),
-        ("test_change2_skips_when_few_messages", test_change2_skips_when_few_messages),
-        ("test_change2_handles_provider_errors_gracefully", test_change2_handles_provider_errors_gracefully),
-        ("test_habit_reflector_plugin_end_to_end_dryrun", test_habit_reflector_plugin_end_to_end_dryrun),
+        test_episodic_provider_subclass_works,
+        test_actionable_habit_provider_subclass_works,
+        test_episodic_store_plugin_record_retrieve,
+        test_habit_promoter_fitness_gate_rejects_weak_candidate,
+        test_habit_promoter_user_approval_gate_blocks_silent_promote,
+        test_habit_promoter_full_pipeline_promotes_when_approved,
+        test_propose_habit_distills_candidates,
     ]
-    passed = 0
+    print("\n=== Path B · 双层架构集成测试 ===\n")
     failed = 0
-    for name, fn in tests:
+    for t in tests:
         try:
-            fn()
-            print(f"  ✓ {name}")
-            passed += 1
+            t()
         except Exception as e:
-            print(f"  ✗ {name}")
-            traceback.print_exc()
             failed += 1
-    print()
-    print(f"=== {passed}/{passed+failed} passed ===")
-    sys.exit(0 if failed == 0 else 1)
+            print(f"  ✗ {t.__name__}: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+    print(f"\n=== {len(tests) - failed}/{len(tests)} passed ===\n")
+    sys.exit(1 if failed else 0)

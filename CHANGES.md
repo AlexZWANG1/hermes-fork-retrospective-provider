@@ -1,75 +1,108 @@
-# Hermes RetrospectiveProvider · 笔试介绍
+# Hermes Fork · 改造详单
 
 ## 一句话讲清楚核心价值
 
-**Hermes 现在每次跟你开新对话，记不住你之前说过 14 次的偏好。我给它加了一个东西：每晚 4 点自动回顾过去 30 天的聊天记录，把反复出现的偏好抽出来写进 USER.md，下次启动它就直接知道。**
+**Hermes 之前没有一种"先想清楚要不要改, 再改"的记忆机制. 我把"全量记录"和"修改 USER.md"拆成两层 · 中间加 fitness firewall + 人审 gate · 让 Hermes 长期不漂移.**
 
 ---
 
-## 体感差异 · 改造前 vs 改造后
+## 为什么不是一层而是两层
 
-**场景**：你用 Hermes 一个月，每次问它 "看下这篇 paper"，每次它都输出一大段 prose。你<b>每次</b>说 "用表格"。说了 14 次。
+### 11.1 学习不是万能
 
-### 改造前 · Hermes 现在的 USER.md 长这样
+GEPA / 单层 RetrospectiveProvider 的最佳情况: 重复任务上越来越快.
+最坏情况: 跨域时蒸馏出的 rule 反而是负向干扰.
 
-```
-- 用户在做 SOTA harness 笔试题
-- 用户在飞机上离线阅读
-- 用户喜欢边讨论边出 HTML
-- 用户在 Obsidian 里看东西
-```
+→ 拆出 Layer A · 它<b>不学习</b> · 不试图泛化 · 只做可靠的 episodic recall.
+→ 这样, 即使 Layer B 蒸馏给错了, 用户依然有 ground truth 可以查.
 
-4 条 entry 全是<b>当下任务状态</b>（笔试题做完就过期）。<b>"用表格"一次都没记下来</b>。下次新对话开始，agent 还是输出 prose，你还是要说"用表格"。
+### 11.2 行为漂移
 
-### 改造后 · 每晚回顾一次后 USER.md 长这样
+单层方案每晚 silent self-modify USER.md · 用户无法定位是哪条改动 / 何时改的 / 怎么 revert.
 
-```
-- 用户强偏好结构化输出（表格 + bullet）而非 prose
-  [conf 1.00 · 8 sessions · decay 2026-08-21]
-- 高频任务：读 paper → 出表格 critique
-  [conf 0.85 · 5 sessions · decay 2026-06-22]
-- 工作日上午 10-13 点短 session 高密度（4-6 turn 完成）
-  [conf 0.85 · 9 sessions · decay 2026-08-21]
-```
-
-同样 500 字符，3 条 entry 全是<b>稳定偏好</b>。每条带证据引用、置信度、过期日期。
-
-**下次开新对话 system prompt 自动注入这 3 条，agent 直接知道 "用表格"。你不用再说。**
+→ 拆出 Layer B · 任何 USER.md 改动必须过<b>三道闸</b>:
+  ① `fitness_test` A/B 评估 → ② `await_user_approval` 人审 → ③ `promote` + audit log + 可 revert
 
 ---
 
-## 为什么 Hermes 现在做不到
+## 改造范围
 
-Hermes 已经有 5 种记忆方式，但<b>全部是 "聊到一半凭感觉记"</b>：
+Hermes 原代码 0 修改 · 全部 additive:
 
-- 每 turn 自动压缩历史
-- 用户主动搜过去聊天
-- LLM 每几句话自反思（可选 Honcho 插件）
-- 每 10 句话提醒 agent 写笔记（写啥看心情）
-- 每 7 天整理 skills（不动 USER.md）
-
-5 种里<b>没有任何一种</b>负责 "事后回顾过去 30 天找规律"。"用表格"被记不下来的根本原因就在这里。
+| 文件 | 性质 | 增量 |
+|---|---|---|
+| `agent/memory_provider.py` | 追加 | +208 行 · 4 个 dataclass + 2 个新 ABC |
+| `agent/memory_manager.py` | 追加 | +172 行 · 双层调度 + 三道闸 pipeline |
+| `plugins/memory/episodic_store/` | 全新 | Layer A 实现 |
+| `plugins/memory/habit_promoter/` | 全新 | Layer B 实现 |
+| `tests/test_pathB_integration.py` | 重写 | 7 个测试覆盖关键不变量 |
 
 ---
 
-## 我做了什么
+## Layer A · `episodic_store`
 
-加了 Hermes 的<b>第 6 种记忆方式</b>：每晚 4 点离线回顾过去 30 天对话。
+| | |
+|---|---|
+| 默认 | <b>enabled · default-on</b> |
+| 干什么 | 每 turn append 一行 JSONL 到 `~/.hermes/episodes/<session>.jsonl` |
+| 不干什么 | 不蒸馏 · 不改 USER.md · 不注入 system prompt |
+| 暴露 tool | `recall_episode(query, top_k, session_id?)` |
+| LLM 调用 | 0 · 写入 < 5ms · pure I/O |
+| 月成本 | $0 |
 
-具体做法 4 步：
+#### 信噪比策略
 
-1. **给 Hermes 加一种新插件类型**叫 `RetrospectiveProvider`（"事后回顾型记忆插件"）
-2. **给 Hermes 的记忆管理员加新职责**：到点了主动叫这种插件起来跑
-3. **给 Hermes 主循环加 8 行触发**：每次用户开新对话，提醒记忆管理员检查一下该不该跑
-4. **写一个具体插件 `habit_reflector`**：调小模型 (Haiku 4.5) 蒸馏 30 天聊天，把高置信度的稳定偏好<b>通过 Hermes 官方 API</b> 写进 USER.md
+写入时<b>不</b>做价值判断. 当下"无聊"的 turn 三个月后可能就是用户要找的那个.
+价值判断推到 retrieve 时 (top_k + ranking, user_pinned 强加分, 时间 tiebreak).
 
-技术上：改了 Hermes 3 个源文件合计 +280 行（全部是追加，不修改原有逻辑）+ 1 个新 plugin 340 行。Hermes 原有 5 层一行没动。
+#### user_pinned 机制
+
+用户可以显式 `pin <episode_id>` · 这一条永远在检索结果顶部. 用来对抗 ranking 误判.
+
+---
+
+## Layer B · `habit_promoter`
+
+| | |
+|---|---|
+| 默认 | <b>disabled · 必须显式 enabled: true</b> |
+| 干什么 | 凌晨 2-5 点蒸馏过去 30 天 episodes → propose candidates → 跑 fitness → 等人审 |
+| 才能写 USER.md 的条件 | ① fitness verdict == "pass" AND ② user_approved == True |
+| LLM 调用 | ~1/day (distiller) + ~8/day (fitness A/B 跑 sample query) |
+| 月成本 | ~$12 (Haiku 4.5 + Sonnet judge) |
+
+#### 三道闸
+
+```python
+# manager.run_habit_promotion_pipeline()
+report = manager.run_habit_promotion_pipeline(
+    candidate, provider=habit_promoter,
+    sample_queries=[...],  # ≥ 8 个 sample query
+    require_user_approval=True,  # 生产必须 True
+)
+
+# 任何一道闸 fail → 不写 USER.md · 记 audit log:
+# - rejected_fitness_fail
+# - rejected_fitness_neutral  (默认 fail · 可配置 0.45 ≤ win_rate < 0.65 时 ask)
+# - rejected_user_declined
+# - rejected_promote_error
+
+# 全过 → promoted · USER.md 写入 + audit log + pending/ 文件移到 promoted/
+```
+
+#### audit log 样例
+
+```json
+{"ts": "2026-05-23T02:14:08Z", "action": "pending", "candidate_id": "hc_a1b2c3d4", "claim": "用户强偏好结构化输出"}
+{"ts": "2026-05-23T08:42:11Z", "action": "promoted", "candidate_id": "hc_a1b2c3d4", "claim": "用户强偏好结构化输出"}
+{"ts": "2026-06-15T19:33:02Z", "action": "reverted", "candidate_id": "hc_a1b2c3d4"}
+```
 
 ---
 
 ## 验证状态
 
-**已验证**：5 个集成测试全过（接口契约、调度逻辑、错误隔离、整链路联动）。跑法：
+**已验证** (7/7 测试通过):
 
 ```bash
 cd hermes-fork-pathB
@@ -77,27 +110,43 @@ export PYTHONPATH="$PWD:$HOME/.hermes/hermes-agent"
 python3 tests/test_pathB_integration.py
 ```
 
-**未验证**：真在 Hermes CLI 端到端跑过（用户本机 venv 损坏阻塞）。真 Haiku 4.5 蒸馏出来的质量也没在真实数据上 label 过——当前测试用的是 14-session 合成 fixture + canned LLM response。
+每个测试覆盖一个关键不变量:
+
+| Test | 不变量 |
+|---|---|
+| Test 1 | Layer A 抽象正确可子类化 |
+| Test 2 | Layer B 抽象正确可子类化 |
+| Test 3 | episodic_store 写入 → 检索 → pin 全链路 |
+| Test 4 | <b>fitness 不达标的 candidate 不能写 USER.md</b> |
+| Test 5 | <b>用户没批准的 candidate 不能写 USER.md</b> |
+| Test 6 | fitness + 人审都过, 写 USER.md + audit log |
+| Test 7 | distiller 蒸馏链路 (dry_run canned) |
+
+**未验证** (诚实标注):
+
+- 真接进 Hermes CLI 端到端跑 (本机 venv 损坏)
+- 真 Haiku 4.5 蒸馏质量在真实样本上 label
+- LLM-as-judge fitness scoring 稳定性 (当前 placeholder)
+- USER.md 在长期 promote / revert 后的内容一致性
 
 ---
 
-## 价值清单 · 它带来什么
+## 价值清单
 
 | 项 | 价值 |
 |---|---|
-| 稳定偏好不再重复纠正 | "用表格"说 5 次后自动记住，省掉后续 9 次纠正 |
-| USER.md 内容质量 | 从 0% preference → 100% preference（同样 500 字符容量） |
-| 高频短任务变 skill | 跨过 Hermes "≥5 tool_call + 任务成功" 的硬门槛 |
-| 自动过期 | preference 90 天衰、habit 30 天衰、task 7 天衰 |
-| Hermes 主对话延迟 | 0 ms 增加（异常只 log warning） |
-| 月运营成本 | ~$12（每天 1 次 Haiku 4.5 蒸馏） |
-| Hermes 旧代码 | 0 行修改 · 零回归风险 |
+| Layer A · 全量 episodic | 即使 Layer B 错了, 用户依然有 ground truth 可查 |
+| Layer A 默认开 | 0 风险副作用 (只写 episodes/) · 不改 behavior |
+| Layer B 默认关 | 用户不知情时不可能发生 self-modify |
+| fitness gate | 不达标的 candidate 不进入用户视野 · 节省用户 review 时间 |
+| 人审 gate | 任何 USER.md 写入用户都签过字 · 漂移问题被堵住 |
+| audit + revert | 所有改动可回溯 · 一键回到任意时间点 |
+| Hermes 原代码 | 0 行修改 · 0 回归风险 |
 | 提 PR 给上游 | 可行 · 是 additive 抽象 |
 
 ---
 
 ## 仓库 + 配套文档
 
-- **代码 + 完整 README**：https://github.com/AlexZWANG1/hermes-fork-retrospective-provider
-- **测试指南**：[TESTING.md](./TESTING.md)
-- **完整工程 spec**：[docs/SPEC.md](./docs/SPEC.md)
+- **代码 + 完整 README**: https://github.com/AlexZWANG1/hermes-fork-retrospective-provider
+- **测试指南**: [TESTING.md](./TESTING.md)

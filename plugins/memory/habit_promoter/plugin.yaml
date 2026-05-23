@@ -1,0 +1,24 @@
+name: habit_promoter
+version: 0.1.0
+description: |
+  Layer B · 从 episodes 蒸馏 habit + fitness gate + 人审 promote.
+  三道闸阻断"行为漂移": fitness A/B → user approval → audit + revertible promote.
+
+enabled: false       # ★ 必须显式 true 才会跑 · 默认关闭
+
+config:
+  distiller_model: "claude-haiku-4-5"
+  window_days: 30
+  promotion_require_user_approval: true   # ★ 不可关 (生产)
+  fitness_min_win_rate: 0.65              # B 至少要这个胜率才能过 fitness
+  fitness_min_samples: 8
+
+# 月运营预估
+costs:
+  llm_calls_per_day: 1                     # 每天 1 次蒸馏
+  api_cost_estimate_usd_monthly: 12.00
+
+# Audit · 一切 promote / revert 都进 audit.log
+audit:
+  enabled: true
+  log_path: ~/.hermes/habit_memory/audit.log

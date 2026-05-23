@@ -1,0 +1,18 @@
+name: episodic_store
+version: 0.1.0
+description: |
+  Layer A · 全量 episode 记录 + 检索. 不学习 / 不改 USER.md / 不注入 system prompt.
+  这一层的价值是<b>可靠的 episodic recall</b> — 即使 Layer B 蒸馏给的是错的, 这一层依然能找到原话.
+
+enabled: true        # ★ default-on · 安全副作用 (只写 episodes/ 文件夹)
+
+config:
+  storage_path: ~/.hermes/episodes/
+  retention_days: 365
+  # 写入时<b>不做</b>价值判断 — "无聊"和"重要"的 turn 全部记下.
+  record_all_turns: true
+
+# 不依赖 LLM call · 0 API cost · 写入延迟 < 5ms
+costs:
+  llm_calls_per_turn: 0
+  api_cost_estimate_usd_monthly: 0.00

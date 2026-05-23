@@ -280,107 +280,214 @@ class MemoryProvider(ABC):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# ★ 路 B 改动 1 · 加 RetrospectiveProvider 抽象（以下全部新增 · ~70 行）
+# 改造 · 拆 RetrospectiveProvider 成两层（以下全部新增 · ~180 行）
 #
-# 大白话讲这一节加了什么:
-# ─────────────────────────────────────
-# 原来 Hermes 的 MemoryProvider 是给"当下记忆插件"用的——agent 当前 turn 发生啥
-# 就立刻 sync_turn / prefetch 一下. 没有"事后回顾"这个概念.
+# 为什么拆两层 · 短答:
+#   把"agent 自动学 habit 改自己 behavior"拆成两件事:
+#   1. EpisodicProvider · 全量记录 · 不改 behavior · 不漂移
+#   2. ActionableHabitProvider · 蒸馏 actionable rules · 必须过 fitness firewall + 人审
 #
-# 我们要加的"回顾型记忆插件"跟它不一样:
-#   · 它不是 turn 级别的, 而是 cron / idle 触发的批处理
-#   · 它要看一段历史 messages, 而不只当下 turn
-#   · 它的输出是 "claims" (一句话结论 + 证据), 不是注入 prompt 的字符串
-#   · 它有自己的 schedule (什么时候该跑)
+# 为什么不能合在一起 · 第一性:
+#   GEPA / habit_reflector 类方案的两个 fundamental 问题:
+#     (11.1) "学习不是万能" · 自动学的 habit 在新领域反而是误导
+#     (11.2) "行为漂移" · agent silent self-modify, 用户无法 audit / revert
+#   把"记录"和"改行为"耦合 → 这两个问题无解
+#   拆开 → episodic 层不改 behavior 不漂移 · actionable 层有 firewall
 #
-# 所以我们在 Hermes 现有 MemoryProvider 体系里加一个<b>子类</b>叫
-# RetrospectiveProvider, 把上面这些"事后回顾"特有的能力规范出来.
-#
-# 任何想做 "agent 回头看过去 N 天发现 user habit" 这件事的人, 都按这个接口实现.
-# Hermes 内核负责调度它们 (见 改动 2 的 MemoryManager.run_retrospective).
+# 详见: README.md "为什么拆两层"
 # ═════════════════════════════════════════════════════════════════════════════
 
 from dataclasses import dataclass, field
 
 
 @dataclass
-class Schedule:
-    """一个 Provider 什么时候该跑的描述."""
+class Episode:
+    """一次 user-agent 交互的全量记录 · 不做信噪比判断."""
 
-    # 间隔小时数. 比如 24 = 每天跑一次.
-    interval_hours: int = 24
-
-    # 用户必须 idle 多久才能跑 (避免打扰交互).
-    min_idle_hours: float = 1.0
-
-    # 冷启动周数 · 装上后前 N 周不跑 (攒数据).
-    cold_start_weeks: int = 1
-
-    # 在 idle 触发时强制要求的小时区间 (None = 任何时段都行).
-    # 例如 (2, 6) = 只允许凌晨 2-6 点跑.
-    allowed_hour_range: Optional[tuple] = None
+    episode_id: str                              # uuid
+    session_id: str
+    turn_n: int
+    timestamp: float                             # unix ts
+    user_content: str                            # 用户原始 prompt
+    assistant_content: str                       # agent 回复
+    context_refs: List[str] = field(default_factory=list)   # 引用的过往 episode_id
+    outcome: Optional[str] = None                # 用户后续反馈 (改正/认可/重试 etc), 可选
+    tags: List[str] = field(default_factory=list)
+    user_pinned: bool = False                    # 用户显式 pin · 永远顶在 retrieve 前面
 
 
 @dataclass
-class Claim:
-    """Retrospective 分析产出的一个'结论' · 带证据 · 带置信度 · 带过期."""
+class HabitCandidate:
+    """从 episodes 蒸馏出的、待审的 actionable rule (尚未注入 USER.md)."""
 
-    claim: str                              # 一句话结论
-    classification: str                     # "preference" | "habit" | "task" | "constraint"
-    evidence: List[Dict[str, Any]]          # 至少 3 个 session_id/turn_n/excerpt 引用
-    confidence: float                       # 0.0 - 1.0
-    decay_at: str                           # ISO date, 何时过期
-    intervention: Optional[str] = None      # 给 agent 的可选指令
-    source: str = "retrospective"
+    candidate_id: str                            # uuid
+    claim: str                                   # 一句话规则
+    classification: str                          # preference / habit / constraint
+    supporting_episodes: List[str]               # ≥3 个 episode_id
+    raw_confidence: float                        # 蒸馏时的初始打分 · 仅作排序
+    proposed_at: str                             # ISO timestamp
+    intervention: Optional[str] = None
+    fitness_report: Optional[dict] = None        # ① 必须通过 fitness 才能 promote
+    user_approved: bool = False                  # ② 必须用户显式审批
 
 
 @dataclass
-class PromotionResult:
-    """promote() 跑完后告诉调度器发生了什么."""
+class FitnessReport:
+    """A/B fitness pipeline 跑出来的结果."""
 
-    promoted_to_usermd: int = 0       # ≥ 0.85 conf 自动写入 USER.md 的数量
-    queued_for_review: int = 0        # 0.7-0.85 入待审 queue
-    dropped_low_conf: int = 0         # < 0.7 仅留日报
-    skill_candidates: int = 0         # habit 类标记给 Curator 的
+    candidate_id: str
+    win_rate_B: float                            # B (with habit) 胜过 A (no habit) 比例
+    verdict: str                                 # "pass" / "fail" / "neutral"
+    n_samples: int = 0
+    notes: str = ""
+    judge_model: str = ""
+    transcript_refs: List[str] = field(default_factory=list)
 
 
-class RetrospectiveProvider(MemoryProvider):
-    """事后回顾型记忆插件 · 基类.
+# ─────────────────────────────────────────────────────────────────────────────
+# Layer A · EpisodicProvider
+#
+# 职责: 全量记录交互 · 不改 behavior · 只在 query 时浮现
+# 关键不变量:
+#   - record() 是 default-on · 永远写入 · 不在写入时做价值判断
+#   - 不出现 promote / inject_to_system_prompt 任何方法
+#   - 任何 implementer 都不应该把 retrieve() 结果<b>主动</b>塞进 system prompt
+#   - retrieval 结果作为 reference 给用户/agent 显式引用, 由用户/agent 决定是否参考
+# ─────────────────────────────────────────────────────────────────────────────
 
-    实现这个类的插件由 MemoryManager 在 idle / cron 时机主动调度,
-    而不是每 turn 都跑. 它们看一段历史 messages 蒸馏出 stable claims,
-    自动 promote 到 USER.md 或队列等用户审.
 
-    跟现有的 MemoryProvider 区别:
-      · MemoryProvider: agent 当下需要时拉 (prefetch / sync_turn)
-      · RetrospectiveProvider: Hermes 定时主动调 (analyze + promote)
+class EpisodicProvider(MemoryProvider):
+    """全量记录 user-agent 交互的 provider · Layer A.
+
+    设计原则:
+      1. Write is cheap: record() 默认对每个 turn 调用, 不做价值判断
+      2. Read is smart: retrieve() 用 multi-signal ranking 浮现相关 episodes
+      3. No behavior modification: episode 不改 agent system prompt, 只作 reference
+      4. No drift risk: 因为不改 behavior, 不存在漂移问题
     """
 
     @abstractmethod
-    def schedule(self) -> Schedule:
-        """这个 provider 多久跑一次 / 什么时候允许跑."""
+    def record(self, episode: Episode) -> None:
+        """全量记录一次交互. 默认每个 turn 都调.
 
-    @abstractmethod
-    def analyze(self, messages: List[Dict[str, Any]], *, window_days: int = 30) -> List[Claim]:
-        """看一段 messages 历史, 蒸馏出一组 Claim.
-
-        参数 messages 是 [{session_id, role, content, turn_n, timestamp}, ...] 列表,
-        由 MemoryManager 从 state.db 读出来喂进来.
-
-        实现侧应当: 调小模型 (Haiku 等) 蒸馏 + 本地公式重算 confidence + 应用 blacklist.
+        实现侧应当: 写盘 / 写 DB · 不调 LLM · 不判断价值.
         """
 
     @abstractmethod
-    def promote(self, claims: List[Claim]) -> PromotionResult:
-        """决定 claims 怎么处理 · 写 USER.md / 入待审 / drop / 标 skill 候选.
+    def retrieve(
+        self,
+        query: str,
+        *,
+        top_k: int = 5,
+        session_id: Optional[str] = None,
+    ) -> List[Episode]:
+        """检索相关 episodes · 由用户/agent 显式查询时触发.
 
-        实现侧应当: 高 conf 走 self.memory_manager 的 memory_write 接口写 USER.md,
-        而不是绕过 Hermes 直接写文件 (这是路 B 跟路 A 的关键差别).
+        实现侧应当: BM25 / embedding / multi-signal ranking 都行.
+        关键: 不能把结果<b>主动注入</b> system prompt · 必须是 pull 模型不是 push.
         """
 
-    def on_promotion_complete(self, result: PromotionResult) -> None:
-        """可选 hook · MemoryManager 调完 analyze/promote 后通知插件结果.
+    def pin(self, episode_id: str) -> None:
+        """用户显式 pin 一个 episode · 检索时永远顶前面."""
 
-        默认 no-op. 子类可以重写做 logging / metrics / notification 等.
+    def unpin(self, episode_id: str) -> None:
+        """取消 pin."""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Layer B · ActionableHabitProvider
+#
+# 职责: 从 episodes 蒸馏 actionable rules · 必须过 fitness gate + 人审才 promote
+# 关键不变量:
+#   - propose_habit() 只产生 candidate · 不直接写 USER.md
+#   - fitness_test() 必须跑 A/B 评估 · verdict pass 才进入下一步
+#   - 进入 USER.md 必须经过 await_user_approval() · 不能 silent self-modify
+#   - 每次 promote 都留 audit trail · 永远可 revert
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class ActionableHabitProvider(MemoryProvider):
+    """从 episodes 蒸馏 actionable rules · Layer B.
+
+    设计原则:
+      1. Promotion is conservative: 只少数 candidates 升级
+      2. Fitness firewall mandatory: 必须 A/B 测试通过 (回应 Decagon "fitness function firewall")
+      3. Human in loop mandatory: 必须用户显式审批 (回应"行为漂移"问题)
+      4. Reversibility: 每条已 promote 的 habit 都可一键 revert + 黑名单
+    """
+
+    @abstractmethod
+    def propose_habit(
+        self,
+        episodes: List[Episode],
+    ) -> List[HabitCandidate]:
+        """从 episodes 中蒸馏出 candidate habits · 不直接 promote.
+
+        实现侧: 调 LLM (Haiku 等) 找 ≥3 个 episode 反复出现的 stable pattern.
+        关键: 返回 HabitCandidate · 不调 memory_tool · 不改 USER.md.
         """
-        return None
+
+    @abstractmethod
+    def fitness_test(
+        self,
+        candidate: HabitCandidate,
+        sample_queries: List[str],
+    ) -> FitnessReport:
+        """A/B 评估: candidate habit 注入 vs 不注入, LLM judge 评分.
+
+        实现侧:
+          ① 对 sample_queries 跑两次 agent:
+             A: 不注入 candidate, B: 注入 candidate
+          ② LLM-as-judge 评 A/B 哪个回复更贴当下 query
+          ③ 计算 win_rate_B 与 verdict (pass/fail/neutral)
+        """
+
+    @abstractmethod
+    def await_user_approval(
+        self,
+        candidate: HabitCandidate,
+    ) -> bool:
+        """提交 candidate 给用户审批 · 返回 True 表示用户批准.
+
+        实现侧: 写 .pending.json + 通知用户审 (CLI / notification 都可)
+        关键: 不能自动 approve · 必须用户显式动作.
+        """
+
+    @abstractmethod
+    def promote(self, candidate: HabitCandidate) -> None:
+        """把已审批的 candidate 写入 USER.md.
+
+        前置条件: candidate.fitness_report.verdict == "pass" AND candidate.user_approved
+        实现侧: 通过 self.memory_manager.handle_tool_call("memory_write", ...) 走官方 API.
+        必须写 audit log: 哪条 habit · 何时 · fitness 报告 · 用户批准时间.
+        """
+
+    @abstractmethod
+    def revert(self, candidate_id: str) -> None:
+        """从 USER.md 删除一条已 promote 的 habit · 加入黑名单.
+
+        关键: 用户随时可调 · 一键回到 promote 前状态.
+        """
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Schedule (两层共用的调度描述)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class Schedule:
+    """provider 什么时候被 manager 调度."""
+
+    # 全量记录类 provider (EpisodicProvider): 每 turn 都调, 这个字段无用
+    # 蒸馏类 provider (ActionableHabitProvider): 多久跑一次 propose
+    interval_hours: int = 24
+
+    # 用户必须 idle 多久才能跑蒸馏 (避免打扰交互)
+    min_idle_hours: float = 1.0
+
+    # 装好后前 N 周不跑蒸馏 (Episodic 层不受这个限制, 永远记)
+    cold_start_weeks: int = 1
+
+    # 在 idle 触发时强制的小时区间 (None = 任何时段都行)
+    allowed_hour_range: Optional[tuple] = None

@@ -555,121 +555,176 @@ class MemoryManager:
                 )
 
     # ═════════════════════════════════════════════════════════════════════════
-    # ★ 路 B 改动 2 · 加 retrospective 调度方法（以下全部新增 · ~80 行）
+    # 改造 · 双层记忆机制的调度方法 (以下全部新增 · ~180 行)
     #
-    # 大白话讲这一节加了什么:
-    # ─────────────────────────────────────
-    # MemoryManager 原来只会"被动响应"——agent 主动调它的方法 (prefetch/sync_turn).
-    # 现在它学会一个新动作: 「主动调度」——巡视所有注册的 RetrospectiveProvider,
-    # 看谁该跑了, 把消息历史喂过去, 让它分析 + promote.
+    # 设计原则:
+    #   Layer A (EpisodicProvider):  default-on · 每 turn record · 不改 behavior
+    #   Layer B (ActionableHabitProvider): default-off · 显式启用 + fitness gate + 人审才 promote
     #
-    # 这是 Hermes 内核第一次有「自我反思 / 自我学习」的调度能力. 不是 plugin 偷偷
-    # 在做事, 是 manager 在统一调度——所有 retrospective 插件公平排队, manager
-    # 决定调谁、何时调、给多少 message 历史、出错怎么办.
+    # 为什么这么拆: 见 README "为什么拆两层"
     # ═════════════════════════════════════════════════════════════════════════
 
-    def get_retrospective_providers(self) -> List["RetrospectiveProvider"]:
-        """返回所有已注册的 RetrospectiveProvider 实例.
+    # ── Layer A 调度 · 全量记录 + 检索 ────────────────────────────────────────
 
-        用 isinstance 判断, 不强行 import (避免循环依赖).
+    def get_episodic_providers(self) -> List["EpisodicProvider"]:
+        """从 providers 里筛 EpisodicProvider 实例."""
+        from agent.memory_provider import EpisodicProvider
+        return [p for p in self._providers if isinstance(p, EpisodicProvider)]
+
+    def record_episode(self, episode) -> None:
+        """每 turn 调一次 · 把这次交互写到所有 EpisodicProvider.
+
+        关键设计: 这里<b>不做价值判断</b>. 全量写. 价值判断在 retrieve 时.
         """
-        # 延迟 import 避免循环依赖
-        from agent.memory_provider import RetrospectiveProvider
-        return [p for p in self._providers if isinstance(p, RetrospectiveProvider)]
+        for provider in self.get_episodic_providers():
+            try:
+                provider.record(episode)
+            except Exception as e:
+                logger.warning(
+                    "EpisodicProvider '%s' record failed (non-fatal): %s",
+                    provider.name, e,
+                )
 
-    def run_retrospective(
+    def retrieve_episodes(
+        self,
+        query: str,
+        *,
+        top_k: int = 5,
+        session_id: Optional[str] = None,
+    ) -> List:
+        """从所有 EpisodicProvider 检索 episodes.
+
+        关键设计:
+          - 返回 List[Episode] 给调用方
+          - <b>不主动注入 system prompt</b>
+          - 由调用方 (用户 query / agent reflection) 决定怎么用
+        """
+        results = []
+        for provider in self.get_episodic_providers():
+            try:
+                results.extend(provider.retrieve(
+                    query, top_k=top_k, session_id=session_id,
+                ))
+            except Exception as e:
+                logger.warning(
+                    "EpisodicProvider '%s' retrieve failed: %s",
+                    provider.name, e,
+                )
+        # 多 provider 时按 user_pinned + 写入时间排序
+        results.sort(key=lambda e: (not e.user_pinned, -e.timestamp))
+        return results[:top_k]
+
+    # ── Layer B 调度 · 蒸馏 + fitness gate + 人审 ─────────────────────────────
+
+    def get_actionable_habit_providers(self) -> List["ActionableHabitProvider"]:
+        from agent.memory_provider import ActionableHabitProvider
+        return [p for p in self._providers if isinstance(p, ActionableHabitProvider)]
+
+    def propose_habits(
         self,
         *,
-        trigger: str = "idle",
-        force: bool = False,
-        message_loader: Optional[callable] = None,
-    ) -> Dict[str, Any]:
-        """巡视所有 RetrospectiveProvider, 把该跑的跑掉.
+        recent_episodes_loader: Optional[callable] = None,
+        window_days: int = 30,
+    ) -> List:
+        """触发所有 ActionableHabitProvider 蒸馏 candidates.
 
-        参数:
-          trigger: 触发原因, 用于 logging + 让 provider 知道是 cron 还是 idle
-            常见值: "idle" / "cron" / "manual" / "conversation_start"
-          force: 跳过 schedule 检查强制跑全部 (调试 / manual 触发用)
-          message_loader: callable() -> List[Dict] · 由调用方提供怎么读 messages.
-            默认 None 时 manager 不知道怎么读, 跳过. 实际部署里 conversation_loop
-            会注入一个从 state.db 读的函数.
-
-        返回:
-          {"ran": [...], "skipped": [...], "errors": [...]}  · 调用方可看日志
+        关键设计:
+          1. 只 propose 不 promote · 返回的是 candidates 而不是已写入的
+          2. recent_episodes_loader 由调用方 (AIAgent / cron / CLI) 注入
+          3. 任何 promote 必须经过下面 run_habit_promotion_pipeline
         """
-        from agent.memory_provider import RetrospectiveProvider  # 延迟 import
+        if recent_episodes_loader is None:
+            logger.debug("propose_habits: no episode loader provided · skip")
+            return []
 
-        # 找所有 retrospective 插件
-        providers = self.get_retrospective_providers()
-        if not providers:
-            logger.debug("run_retrospective(%s): no RetrospectiveProviders registered", trigger)
-            return {"ran": [], "skipped": [], "errors": []}
-
-        ran, skipped, errors = [], [], []
-
-        for provider in providers:
-            # 第 1 步: schedule 检查
-            sched = provider.schedule()
-            if not force and not self._is_provider_due(provider, sched, trigger):
-                skipped.append({"name": provider.name, "reason": "schedule not due"})
-                continue
-
-            # 第 2 步: 读 messages 历史 (调用方提供 loader · 解耦)
-            if message_loader is None:
-                skipped.append({"name": provider.name, "reason": "no message_loader provided"})
-                continue
+        all_candidates = []
+        for provider in self.get_actionable_habit_providers():
             try:
-                window_days = getattr(sched, "window_days", 30)
-                messages = message_loader(window_days=window_days)
+                episodes = recent_episodes_loader(window_days=window_days)
+                if len(episodes) < 10:
+                    logger.info(
+                        "ActionableHabitProvider '%s': too few episodes (%d) · skip propose",
+                        provider.name, len(episodes),
+                    )
+                    continue
+                candidates = provider.propose_habit(episodes)
+                logger.info(
+                    "ActionableHabitProvider '%s': proposed %d candidates",
+                    provider.name, len(candidates),
+                )
+                all_candidates.extend(candidates)
             except Exception as e:
-                errors.append({"name": provider.name, "stage": "load", "error": str(e)})
-                continue
+                logger.warning(
+                    "ActionableHabitProvider '%s' propose failed: %s",
+                    provider.name, e,
+                )
+        return all_candidates
 
-            if len(messages) < 10:
-                skipped.append({"name": provider.name, "reason": f"too few messages ({len(messages)})"})
-                continue
+    def run_habit_promotion_pipeline(
+        self,
+        candidate,
+        *,
+        provider,
+        sample_queries: List[str],
+        require_user_approval: bool = True,
+    ) -> dict:
+        """走完整 promotion pipeline · fitness gate + 人审 · 通过才进 USER.md.
 
-            # 第 3 步: 喂给 provider analyze
-            try:
-                claims = provider.analyze(messages, window_days=window_days)
-            except Exception as e:
-                errors.append({"name": provider.name, "stage": "analyze", "error": str(e)})
-                continue
+        Pipeline (回应 "行为漂移 / fitness function firewall"):
+          ① provider.fitness_test(candidate, sample_queries) → FitnessReport
+          ② 如果 fitness.verdict != "pass" → 直接 reject + 黑名单
+          ③ 如果 require_user_approval=True · 调 await_user_approval
+          ④ 用户批准后才 provider.promote(candidate)
+          ⑤ 全程留 audit log
 
-            # 第 4 步: 让 provider 决定 claims 怎么用 (写 USER.md / 入待审 / drop)
-            try:
-                result = provider.promote(claims)
-                provider.on_promotion_complete(result)
-            except Exception as e:
-                errors.append({"name": provider.name, "stage": "promote", "error": str(e)})
-                continue
+        关键设计: 任何 silent self-modify 路径都被这个 pipeline 堵住.
+        """
+        report = {
+            "candidate_id": candidate.candidate_id,
+            "stages": [],
+            "decision": None,
+        }
 
-            ran.append({
-                "name": provider.name,
-                "claims_total": len(claims),
-                "result": result,
+        # ① fitness test
+        try:
+            fitness = provider.fitness_test(candidate, sample_queries)
+            candidate.fitness_report = fitness.__dict__ if hasattr(fitness, "__dict__") else fitness
+            report["stages"].append({
+                "stage": "fitness_test",
+                "verdict": fitness.verdict,
+                "win_rate_B": fitness.win_rate_B,
             })
-            logger.info(
-                "Retrospective ran: %s · %d claims · promoted %d / queued %d / dropped %d",
-                provider.name, len(claims),
-                result.promoted_to_usermd, result.queued_for_review, result.dropped_low_conf,
-            )
+        except Exception as e:
+            report["stages"].append({"stage": "fitness_test", "error": str(e)})
+            report["decision"] = "rejected_fitness_error"
+            return report
 
-        return {"ran": ran, "skipped": skipped, "errors": errors}
+        if fitness.verdict != "pass":
+            report["decision"] = f"rejected_fitness_{fitness.verdict}"
+            return report
 
-    def _is_provider_due(self, provider, schedule, trigger: str) -> bool:
-        """检查一个 provider 现在是否该跑 (interval + idle + cold-start 三关).
+        # ② 用户审批 (可选 skip · 但生产环境必须开)
+        if require_user_approval:
+            try:
+                approved = provider.await_user_approval(candidate)
+                candidate.user_approved = bool(approved)
+                report["stages"].append({"stage": "user_approval", "approved": bool(approved)})
+            except Exception as e:
+                report["stages"].append({"stage": "user_approval", "error": str(e)})
+                report["decision"] = "rejected_approval_error"
+                return report
 
-        实际 cold-start / last-run-at 状态由 provider 自己维护
-        (通过 provider.initialize 时传入的 hermes_home 路径). 这里只做最基本的
-        idle window 和 trigger type 过滤.
-        """
-        from datetime import datetime
-        # idle 窗口检查 (只在 allowed_hour_range 跑)
-        if schedule.allowed_hour_range:
-            hour = datetime.now().hour
-            lo, hi = schedule.allowed_hour_range
-            if not (lo <= hour <= hi):
-                return False
-        # 其它如 interval / cold-start 由 provider 自己在 analyze 里检查
-        return True
+            if not approved:
+                report["decision"] = "rejected_user_declined"
+                return report
+
+        # ③ 通过所有 gate · 真 promote
+        try:
+            provider.promote(candidate)
+            report["stages"].append({"stage": "promote", "ok": True})
+            report["decision"] = "promoted"
+        except Exception as e:
+            report["stages"].append({"stage": "promote", "error": str(e)})
+            report["decision"] = "rejected_promote_error"
+
+        return report
