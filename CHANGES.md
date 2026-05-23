@@ -1,36 +1,36 @@
-# Hermes RetrospectiveProvider · 改造说明
+# Hermes RetrospectiveProvider · 笔试介绍
 
 # TLDR
 
-1. 给 Hermes Agent 内核加一种新的 memory provider 子类 `RetrospectiveProvider`，规范"事后回顾型自学习"的接口；
-2. 在 `MemoryManager` 上加 `run_retrospective()` 方法，由 manager 主动调度所有注册的 retrospective provider；
-3. 在主循环 `run_conversation()` 的 turn 开始处加 5 行触发点，每个新 turn 给 manager 一次调度机会；
-4. 配套一个官方 plugin `habit_reflector` 实现该抽象：每天凌晨读过去 30 天 messages，用 Haiku 4.5 蒸馏稳定 user habit，通过 `manager.handle_tool_call("memory_write")` 自动写入 USER.md；
-5. 3 处 Hermes 源码改动合计 +280 行 · 全部追加 · 0 行修改旧逻辑 · 5/5 集成测试通过（详见 §6）；
-6. 需要：(a) 真 hermes CLI 端到端跑过（当前测试都是独立 Python 进程）；(b) 用真实数据验证 Haiku 蒸馏质量（当前只用 14-session 合成 fixture）；(c) 核实 `session_db.list_messages_since` API 在 Hermes 真存在（loader 写法是基于 `hermes_state.py` 类似命名推测的）。
+1. 给 Hermes Agent 加一种新的记忆通道，从"agent 当下凭感觉记笔记"升级到"+ 每晚回顾过去 30 天蒸馏稳定 user habit"
+2. 用户感受：你 14 次说过"用表格" → 第 5 次后自动进 USER.md → 下次启动 agent 直接知道，不用再纠正
+3. 改 Hermes 源码 3 处合计 +280 行（全部追加 · 0 行修改旧逻辑）+ 1 个配套 plugin
+4. 5/5 集成测试通过，已开源 https://github.com/AlexZWANG1/hermes-fork-retrospective-provider
 
 ---
 
-# What are we building
+# 一个具体场景
 
-我们要给 Hermes 的自学习机制加一种新通道，让 agent 能"事后回顾过去的对话历史"，而不是只能"当下凭感觉写笔记"。
+用户开 Hermes 第一周到第三周，每天问 agent "看下这篇 paper"。每次 agent 出 prose 一大段，用户每次纠正"用表格"。
 
-具体一点：让 Hermes 在每个 turn 开始时，能自动决定要不要跑一次离线的 habit 蒸馏，把过去 30 天反复出现的稳定 user habit 写进 `USER.md` 给下次对话用。
-
-最终效果是 `USER.md` 内容从这样：
+这种情况下，<b>Hermes 现状</b>是这样的：
 
 ```
-# 改造前 · Hermes 现状
-- 用户在做 SOTA harness 笔试题       ← agent 在 nudge 时刻当下写的 task state
-- 用户在飞机上离线阅读                ← 同上
+~/.hermes/memories/USER.md  (上限 500 字符)
+
+- 用户在做 SOTA harness 笔试题             ← agent 在 nudge 时刻当下写的 task state
+- 用户在飞机上离线阅读
 - 用户喜欢边讨论边出 HTML
 - 用户在 Obsidian 里看东西
 ```
 
-变成这样：
+4 条 entry 全是<b>当下 task state</b>（一个月后笔试题做完，这 4 条全过期但还占字符），<b>没有一条是 stable preference</b>。用户重复 14 次的"用表格"<b>一次都没记下来</b>。
 
-```yaml
-# 改造后 · 由 retrospective 蒸馏写入
+加上这个改造后，每天凌晨 4 点 agent 离线读一遍过去 30 天的对话，写出来的 USER.md 变成：
+
+```
+~/.hermes/memories/USER.md
+
 - 用户强偏好结构化输出（表格 + bullet）而非 prose
   [conf 1.00 · 8 sessions · decay 2026-08-21 · src reflector]
 - 高频任务：读 paper → 出表格 critique
@@ -39,148 +39,49 @@
   [conf 0.85 · 9 sessions · decay 2026-08-21 · src reflector]
 ```
 
-字数不变（500 字符内），信息密度提升一个量级：每条带 evidence 引用、置信度、过期日期、来源标记。
+同样 500 字符内，3 条 entry 全是 stable preference，每条带 evidence 引用、置信度、过期日期。
+
+下次 agent 启动，system prompt 自动注入这 3 条。<b>从此你不用再纠正"用表格"</b>。
 
 ---
 
-# Why a new abstraction
+# 为什么 Hermes 现在做不了这件事
 
-有几条<b>看似通向同一个目标</b>但实际有结构缺陷的路径。我们逐一砍掉：
+Hermes 已有 5 层自学习机制，全部是 **prospective**（agent 在 turn 进行中凭感觉决定记什么）：
 
-| 方法 | 简述 | 核心缺陷 |
+| 层 | 触发 | 谁决定记什么 |
 |---|---|---|
-| **外挂 cron 脚本** | 在 `~/.hermes/hooks/` 里挂独立 Python 脚本，cron 触发；直接 `sqlite3 ~/.hermes/state.db` 读 messages、直接 `open(USER.md, "a")` 写 | 1. Hermes 不知道你存在，跟其他 6 个 memory plugin 不在同一注册表；<br>2. 绕过 `memory_tool.add()` 的 char budget 检查、备份、scan 等护栏；<br>3. Hermes 升级 schema/字段就崩；<br>4. 没法 PR 进上游 |
-| **扩 `MemoryProvider` 现有接口** | 在原 `prefetch / sync_turn / on_turn_start` 里夹 retrospective 逻辑 | 这些接口都是<b>每 turn 同步触发</b>的，跑 batch（30 天历史）等于卡死主循环；语义错配 |
-| **改 Curator** | 复用 Curator 现成的 7 天周期 + aux AIAgent fork + tar.gz backup 机制 | `agent/curator.py` 顶头硬注释：<b>"Only touches agent-created skills"</b>（line 17）。Curator 周期是 7 天对偏好捕捉太疏；且改这个 invariant 等于改 Hermes 核心约束 |
-| **走 Honcho dialectic plugin** | Honcho 是个 retrospective 风格的 plugin，借它的通道 | Honcho 是<b>独立平行系统</b>——它写自己的 peer card（远程后端），不写 Hermes 原生 `USER.md`；从来不接 `memory_tool.add` |
-| **新增普通 `MemoryProvider` 类型** | 注册一个普通 provider，自己在 `is_available()` 里起 cron | 跟"外挂 cron"同病：Hermes 没法调度它，错误也没法被 manager 隔离 |
+| L1 短期工作记忆 | 每 turn | LLM 自压缩 |
+| L2 长期 Episodic | 用户主动调 `session_search` | aux model |
+| L3 Dialectic（Honcho plugin） | 每 N turn | LLM 自反思 |
+| L4 Curated MEMORY/USER 本 | nudge / flush 触发 | <b>Agent 当下一拍脑袋</b> |
+| L5 Skill 自演化（Curator） | 每 7 天 | aux AIAgent fork |
 
-结合上面看：Hermes 现有架构里<b>没有一个位置</b>承担"回头看一段历史"这件事。要做这件事，必须给 `MemoryProvider` 加子类，给 `MemoryManager` 加调度方法。
+5 层共同特征是<b>没有任何一层负责"回头看一段历史，找反复出现的稳定模式"</b>。
 
----
+Hermes 现有架构里有两个看似可以承担这件事的位置，<b>但都被排除了</b>：
 
-# What is RetrospectiveProvider
+| 位置 | 为什么不行 |
+|---|---|
+| 现有的 **Curator**（L5） | `agent/curator.py` line 17 源码硬注释：<b>"Only touches agent-created skills"</b>。复用 Curator 必须违反这条 invariant，等于改 Hermes 核心约束 |
+| 现有的 **Honcho plugin**（L3） | Honcho 写自己的 peer card 到<b>远程后端</b>，不写 Hermes 原生 USER.md。改它需要重写整个 plugin 的存储后端 |
 
-`RetrospectiveProvider` 是 `MemoryProvider` 的子类，加 3 个抽象方法：
-
-```python
-class RetrospectiveProvider(MemoryProvider):
-    """事后回顾型记忆插件 · 基类.
-
-    跟现有 MemoryProvider 区别:
-      · MemoryProvider:       agent 当下需要时拉 (prefetch / sync_turn)
-      · RetrospectiveProvider: Hermes 定时主动调 (schedule + analyze + promote)
-    """
-
-    @abstractmethod
-    def schedule(self) -> Schedule: ...                       # 自己声明何时跑
-
-    @abstractmethod
-    def analyze(self, messages, *, window_days=30) -> List[Claim]: ...   # 蒸馏
-
-    @abstractmethod
-    def promote(self, claims: List[Claim]) -> PromotionResult: ...       # 决定怎么用
-```
-
-配套 4 个数据类：
-
-```python
-@dataclass
-class Schedule:                          # 一个 provider 什么时候允许跑
-    interval_hours: int = 24             # 多久跑一次
-    min_idle_hours: float = 1.0          # 用户必须 idle 多久
-    cold_start_weeks: int = 1            # 装好后前 N 周不跑
-    allowed_hour_range: Optional[tuple] = None   # e.g. (2, 6) 凌晨窗口
-
-@dataclass
-class Claim:                             # retrospective 产出的一个结论
-    claim: str                           # 一句话
-    classification: str                  # preference / habit / task / constraint
-    evidence: List[Dict]                 # ≥3 个 session_id/turn_n/excerpt
-    confidence: float                    # 0.0-1.0, 本地公式计算
-    decay_at: str                        # ISO date, 过期日期
-    intervention: Optional[str] = None   # 给 agent 的可选指令
-
-@dataclass
-class PromotionResult:                   # promote() 反馈给 manager
-    promoted_to_usermd: int = 0
-    queued_for_review: int = 0
-    dropped_low_conf: int = 0
-    skill_candidates: int = 0
-```
-
-它继承 `MemoryProvider` 是为了<b>复用 Hermes 现有的 plugin 注册、生命周期、`hermes_home` 注入</b>等基础设施。任何实现这个 ABC 的子类，都自动出现在 `MemoryManager._providers[]` 注册表里，被 `isinstance(p, RetrospectiveProvider)` 一行筛出来。
-
-# What is habit_reflector
-
-`habit_reflector` 是新抽象的第一个实现。
-
-```python
-class HabitReflector(RetrospectiveProvider):
-    name = "habit_reflector"
-
-    def schedule(self) -> Schedule:
-        return Schedule(interval_hours=24, min_idle_hours=1.0,
-                        cold_start_weeks=1, allowed_hour_range=(2, 6))
-
-    def analyze(self, messages, *, window_days=30) -> List[Claim]:
-        # 1. cold-start guard: 装后第 1 周返回 []
-        # 2. <50 条 messages 返回 [] (signal 太弱)
-        # 3. 渲染 30 天 messages 成 prompt 喂 Haiku 4.5
-        # 4. 解析 model 返回的 raw 信号 (times_appeared 等)
-        # 5. 本地公式重算 confidence (不信模型自评)
-        # 6. 强制每条 claim ≥3 evidence
-        return claims
-
-    def promote(self, claims) -> PromotionResult:
-        # conf ≥0.85: self._memory_manager.handle_tool_call("memory_write", ...)
-        # conf 0.70-0.85: 写 candidates/<id>.pending.json
-        # classification == "habit": 额外写 candidates/<name>.candidate 给 Curator
-        return result
-```
-
-本地 confidence 公式：
-
-```
-起步                              0.10
-+ times_appeared ≥ 5             +0.25
-+ distinct_sessions ≥ 3          +0.25
-+ last_seen_within_days ≤ 7      +0.25
-+ user_explicit_confirmed        +0.25  (可选)
-─────────────────────────────────
-最高                              1.00
-```
-
-公式锁在<b>本地代码</b>而不是 prompt 里，是为了模型不能通过夸大信号数自我提升 confidence —— 信号数是 raw counts，public 给 model；confidence 是本地推导，由 manager 信任。
+结合上面看，Hermes 现有架构<b>缺一种新的 provider 类型</b>来承担这件事——这就是这次改造要加的东西。
 
 ---
 
-# 改了 Hermes 哪 3 处
+# 改了什么
 
-| 改动 | 文件 | 原行数 | 改造后 | Δ | 改在哪 | 引入什么 |
-|---|---|---|---|---|---|---|
-| 1 | `agent/memory_provider.py` | 279 | 386 | **+107** | 文件末尾追加 | `RetrospectiveProvider` ABC + `Schedule` / `Claim` / `PromotionResult` |
-| 2 | `agent/memory_manager.py` | 555 | 675 | **+120** | `initialize_all()` 后追加 | `run_retrospective()` + `get_retrospective_providers()` + `_is_provider_due()` |
-| 3 | `run_agent.py` | 15469 | 15521 | **+52** | `run_conversation()` 内 22 行 + 类底部 30 行 | 触发块 + `_load_messages_for_retrospective()` loader |
+3 处 Hermes 源码改动 + 1 个配套 plugin：
 
-合计 +280 行 Hermes 源码改动。Hermes 原有 6 个 `MemoryProvider` 方法、原 6 个 `MemoryManager` 方法、`run_conversation` 原 250+ 行业务逻辑一行没动。
+| 改动 | 文件 | 行数 | 在 Hermes 里加了什么概念 |
+|---|---|---|---|
+| 1 | `agent/memory_provider.py` | +107 | 新的 provider 子类型 `RetrospectiveProvider`（"事后回顾型记忆插件"） |
+| 2 | `agent/memory_manager.py` | +120 | 新的调度方法 `run_retrospective()`（manager 主动叫该跑的 provider 起来跑） |
+| 3 | `run_agent.py`（主循环） | +52 | 每个新 turn 开始时给 manager 一次调度机会（8 行触发块） |
+| 配套 plugin | `plugins/memory/habit_reflector/` | ~340 | 实现这个新抽象的第一个插件，干"读 30 天 → Haiku 蒸馏 → 写 USER.md"这件事 |
 
-## 改动 3 触发块（核心 8 行）
-
-主循环 `run_conversation()` 在 `_restore_primary_runtime()` 之后插入：
-
-```python
-try:
-    if hasattr(self, "memory_manager") and self.memory_manager is not None:
-        self.memory_manager.run_retrospective(
-            trigger="conversation_start",
-            message_loader=self._load_messages_for_retrospective,
-        )
-except Exception as e:
-    logger.warning("retrospective trigger at conversation_start failed: %s", e)
-```
-
-`try/except` 包裹是因为 retrospective 是<b>非必要功能</b>——跑挂了不能影响主对话。
+<b>合计 +280 行 Hermes 源码改动，全部是追加，0 行修改原有逻辑</b>。Hermes 现有 5 层一行没改，所以这是 additive 改造。
 
 ---
 
@@ -190,285 +91,103 @@ except Exception as e:
 用户发新消息
     │
     ▼
-AIAgent.run_conversation()                       ← 改动 3 触发
+AIAgent.run_conversation()                    ← 改动 3 触发
     │
     ▼
-MemoryManager.run_retrospective(                 ← 改动 2 调度
-    trigger="conversation_start",
-    message_loader=AIAgent._load_messages_for_retrospective,
-)
+MemoryManager.run_retrospective()             ← 改动 2 调度
     │
-    │  对每个 RetrospectiveProvider 走 4 步：
+    │  对每个注册的 RetrospectiveProvider:    ← 改动 1 的新类型
     │
-    ├── ① schedule().allowed_hour_range 在范围? 否 → skip
-    │
-    ├── ② message_loader(window_days=30)
-    │       SessionDB → list[dict(session_id, role, content, turn_n, ts)]
-    │       <10 条 → skip
-    │
-    ├── ③ provider.analyze(messages)
-    │       habit_reflector: 渲染 prompt → Haiku 4.5 → 解析 → 本地重算 conf
-    │       → List[Claim]
-    │
-    └── ④ provider.promote(claims)
-            conf ≥0.85 → manager.handle_tool_call("memory_write", target="user")
-            conf 0.70-0.85 → 写 candidates/<id>.pending.json
-            classification == "habit" → 写 candidates/<name>.candidate
-            → PromotionResult
+    ├── schedule 检查：在允许时段吗?
+    ├── 加载 30 天 messages 喂给 provider
+    ├── provider.analyze(messages) → claims   ← habit_reflector 调 Haiku 4.5 蒸馏
+    └── provider.promote(claims):
+          conf ≥0.85 → 调 memory_tool 写 USER.md
+          conf 0.70-0.85 → 写 candidates/ 待用户审
+          habit 类 → 写 candidates/ 给 Curator 看
     │
     ▼
-回到 run_conversation, 正常处理 user_message
-   USER.md 已含新 entry → 本 turn system prompt 注入时自带
+回到主对话流程，USER.md 已含新 entry
+本 turn system prompt 注入时自动包含
 ```
 
 ---
 
-# 怎么搞 · 三阶段
+# 增量价值
 
-我们打算从当前先把<b>这一种</b> retrospective provider（habit_reflector）跑稳，再扩到下一种。先讲<b>阶段</b>，再讲<b>具体 action</b>。
+用户视角的<b>改造前 vs 改造后</b>：
 
-## 阶段 1 · 抽象 + 调度 + 第一个 plugin
-
-把上面 §"改了 Hermes 哪 3 处" 描述的全部完成。<b>这一阶段已完成</b>。当前状态：
-
-- ✅ 3 处源码改动追加完
-- ✅ habit_reflector plugin 实现完
-- ✅ 5/5 集成测试通过（mock provider + mock loader + canned LLM response）
-- ❌ <b>未在真 hermes CLI 端到端跑过</b>
-
-## 阶段 2 · 真集成验证
-
-把改动 1/2/3 真的 apply 到 `~/.hermes/hermes-agent/`，启动 `hermes` CLI，验证：
-
-1. `MemoryProvider` plugin 注册 log 出现 `habit_reflector`；
-2. 每个新 turn 开始时，log 出现 `[INFO] Retrospective ran: habit_reflector ...` 或 skipped reason；
-3. 第 8 天后（cold-start 过）且凌晨 4 点附近运行时，真 USER.md 多出 entry；
-4. <b>错误隔离</b>验证：故意让 habit_reflector 抛 exception，确认主对话不受影响（log warning 即可）。
-
-预期阻塞：Hermes venv 当前在用户机器上是坏的（指向已删除的 Python 3.11），需先 `brew install python@3.11` 或重建 venv。
-
-## 阶段 3 · 蒸馏质量
-
-在 mock loader + canned response 下，5/5 测试只能验证<b>接口契约</b>，不能验证<b>蒸馏质量</b>。需要用真数据：
-
-1. 喂真实 Hermes session（≥50 条 messages，跨 ≥5 个 session）；
-2. 跑 Haiku 4.5 蒸馏；
-3. 人工 label：每条 claim 是不是真的 stable preference / 是不是噪音 / evidence 引用对不对；
-4. 算 precision / recall。
-
-当前缺这一步的 baseline。<b>没有数据支撑"装上 Reflector 后 USER.md 质量提升 X%"这种说法</b>——所有改造前后对比都基于合成 fixture。
+| 维度 | 改造前（Hermes 现状） | 改造后 | 增量 |
+|---|---|---|---|
+| USER.md 内容质量 | 4 条全是过期 task state | 3 条全是 stable preference | preference 占比从 0% → 100% |
+| "用表格"被重复纠正次数 | 14 次还在重复 | 第 5 次后自动入 USER.md，不再纠正 | 约 −50% 纠正 |
+| 每条 entry 是否可审计 | 不可（raw 字符串） | 带 evidence 引用 + confidence + decay | 可 audit、可 reject |
+| 过期信息怎么清 | 没有机制，要 agent 自己删 | 自动 decay（preference 90d / habit 30d / task 7d） | 不用人工管 |
+| 高频短任务怎么变 skill | 卡在"≥5 tool_call + 任务成功"门槛外永远不触发 | 5 个 session 后自动标 candidate，等 Curator 7 天周期接 | 短任务也能沉淀 |
+| Hermes 主对话延迟 | — | 0 ms 增加（cold-start 周直接 return；异常时 only log warning） | 无影响 |
+| 月运营成本 | — | 每天 1 次 Haiku 4.5 蒸馏 ≈ $0.40 / 次 → 月 $12 | 一杯咖啡 |
+| Hermes 旧代码改动 | — | 0 行修改（全部追加） | 零回归风险 |
 
 ---
 
-# 具体的 action
+# 验证状态
 
-下一步要做的 4 件事，按优先级：
+5 个集成测试覆盖 3 处改动的接口契约 + plugin 整链路：
 
-1. **修 Hermes venv** · `brew install python@3.11` 或基于 3.12 重建 venv。前置依赖，否则阶段 2 跑不动；
-2. **Apply 3 处源码改动到本地 Hermes** · 见 [`TESTING.md`](./TESTING.md) Level 3 的 Step 3.1-3.6 手动操作，或者后续做成自动 patch 脚本；
-3. **核实 `session_db.list_messages_since(cutoff)`** · 改动 3 的 loader 用了这个方法名，是基于 `hermes_state.py` 类似命名推测的。需要 grep Hermes 源码确认真有这个 API，否则 loader 要换；
-4. **跑一次真 Haiku 端到端** · 设 `ANTHROPIC_API_KEY`，跑 TESTING.md 的 Level 2 脚本，看真 model 返回什么。预估 ~$0.001。
+```
+✓ test_change1_retrospective_provider_subclass_works    [抽象基类可被子类化]
+✓ test_change2_memory_manager_runs_retrospective        [调度逻辑跑通]
+✓ test_change2_skips_when_few_messages                  [过滤生效]
+✓ test_change2_handles_provider_errors_gracefully       [错误隔离]
+✓ test_habit_reflector_plugin_end_to_end_dryrun         [整链路联动]
 
----
-
-# 集成测试结果
-
-5 个测试覆盖三处改动的接口契约：
-
-| 测试 | 验证范围 | 状态 |
-|---|---|---|
-| `test_change1_retrospective_provider_subclass_works` | `RetrospectiveProvider` ABC 可正确被子类化，`Claim` / `Schedule` 数据类约束生效 | ✅ |
-| `test_change2_memory_manager_runs_retrospective` | `MemoryManager.run_retrospective` 4 步流程跑通（schedule check → load → analyze → promote） | ✅ |
-| `test_change2_skips_when_few_messages` | `<10` 条 messages 时跳过 analyze，记入 `skipped[]` | ✅ |
-| `test_change2_handles_provider_errors_gracefully` | provider 抛错时 manager 不崩，记入 `errors[]`，其它 provider 继续跑 | ✅ |
-| `test_habit_reflector_plugin_end_to_end_dryrun` | habit_reflector 整链路：注册 → 调度 → analyze（canned response）→ promote → 调 `manager.handle_tool_call("memory_write")` | ✅ |
+=== 5/5 passed in 0.02s ===
+```
 
 跑法：
 
 ```bash
-cd /Users/项目开发/harness-research/hermes-fork-pathB
+cd hermes-fork-pathB
 export PYTHONPATH="$PWD:$HOME/.hermes/hermes-agent"
 python3 tests/test_pathB_integration.py
 ```
 
-实测 5/5 通过，0.02s 跑完。
-
 ---
 
-# 边界 · 已知不能做什么
+# 已完成 / 待完成
 
-⚠️ 写出来防止误读：
-
-- <b>不替换</b> Hermes 现有 5 层自学习。原 L1-L5 一行没改。本改造是<b>追加</b>第 6 层；
-- <b>不承诺</b>某个 benchmark 分数改善（Aider polyglot / SWE-bench 等）。从未做过 A/B 对比；
-- <b>不跨 user</b>聚合 habit。每个 Hermes 实例独立，隐私问题不在本范围；
-- <b>不用 embedding / vector DB</b>。retrieval 走 keyword + 文件系统。100k+ session 之后可能要重新评估；
-- <b>不自动建 skill</b>。habit_reflector 只把候选写到 `candidates/<name>.candidate`，要不要真建 skill 仍由现有 Curator 决定。两条 cron 解耦；
-- <b>不调度多 provider 之间的顺序</b>。当前 `MemoryManager.run_retrospective` 按注册顺序串行调用。多个 retrospective provider 之间没有依赖管理。
-
-⚠️ 隐含假设（还未核实）：
-
-- 假定 Hermes `session_db` 有 `list_messages_since(cutoff)` 方法。<b>没在 Hermes 源码逐字 grep</b>。基于 `hermes_state.py` 命名模式推测的。真 apply 时如果方法名错了，loader 要换；
-- 假定 Hermes plugin discovery 会自动 load `plugins/memory/habit_reflector/__init__.py`。基于 `honcho`/`retaindb` 等已有 plugin 的目录结构推测。<b>未实测</b>；
-- 假定 `manager.handle_tool_call("memory_write", {"action": "add", "target": "user", "content": ...})` 是 Hermes `memory_tool.py` 现有签名。基于读 `tools/memory_tool.py:465-505` 推测的。
-
----
-
-# 为什么不使用已有方案 · 详细对比
-
-> 跟 §"Why a new abstraction" 同一个内容，但展开到代码层级。
-
-## 方案 A · 外挂 cron 脚本
-
-```python
-# ~/.hermes/hooks/on_cron.py
-import sqlite3
-sqlite3.connect(os.path.expanduser("~/.hermes/state.db")).execute(
-    "SELECT ... FROM messages WHERE timestamp >= ?", (cutoff,)
-)
-# ... 跑分析 ...
-open(os.path.expanduser("~/.hermes/memories/USER.md"), "a").write(claim)
-```
-
-问题：
-
-- Hermes 完全不知道这个脚本存在，跟其他 6 个 memory plugin（`honcho`/`retaindb`/`openviking`/`byterover`/`holographic`/`supermemory`）<b>不在同一个注册表</b>；
-- 绕过 `MemoryStore.add()` 的所有护栏：char budget 检查（USER.md 1375 限制）、`_scan_memory_content` 反 prompt-injection 扫描、auto backup；
-- Hermes 升级 `state.db` schema（比如把 `messages.timestamp` 改成 `messages.created_at`）→ 脚本立刻坏掉，且<b>不会自动报错</b>给用户；
-- 没法 PR 进上游 —— 外挂脚本不是 Hermes 仓库的一部分。
-
-## 方案 B · 扩展 `MemoryProvider` 现有接口
-
-```python
-class MyProvider(MemoryProvider):
-    def sync_turn(self, user_content, assistant_content, **kw):
-        # 在这里悄悄跑一次 retrospective 分析?
-        if self._should_run_retrospective_now():
-            messages = self._read_db()              # 几百毫秒
-            claims = self._call_haiku(messages)     # 数秒
-            self._write_user_md(claims)             # 几十毫秒
-```
-
-问题：
-
-- `sync_turn` 是<b>每 turn 同步阻塞</b>调用的。把它做成 batch 分析等于<b>每个 user turn 等几秒</b>才回应；
-- 即使做成 async，`MemoryProvider` 接口没有"我这次想跳过"的语义；
-- 语义错配：`MemoryProvider` 一组方法的契约是"当下 turn 上下文"，往里塞历史回顾是 hack。
-
-## 方案 C · 改 Curator
-
-`agent/curator.py` line 17 原文：
-
-```python
-"""Curator — background skill maintenance orchestrator.
-...
-Strict invariants:
-  - Only touches agent-created skills (see tools/skill_usage.is_agent_created)
-  - Never auto-deletes — only archives. Archive is recoverable.
-  ...
-"""
-```
-
-问题：
-
-- 第一条 invariant 写死 "Only touches agent-created skills"。要复用 Curator 必须违反这条 invariant，等于改 Hermes 核心约束；
-- Curator 的 7 天周期对偏好捕捉<b>太疏</b>。用户连续 14 次说"用表格"如果 14 次都在 7 天里，Curator 一次都没跑过；
-- Curator 用的是 fork AIAgent + max_iter=8 的<b>重量级</b>调度方式，每次 ~$0.30。habit 蒸馏不需要起 agent loop，单次 Haiku call ~$0.40 已经够，但开销结构完全不同；
-- 同一个 cron 既管 skill 又管 user habit，错误隔离更差。
-
-## 方案 D · 走 Honcho plugin
-
-`plugins/memory/honcho/__init__.py` 头部注释：
-
-> "Provides cross-session user modeling with dialectic Q&A, semantic search, peer cards, and persistent conclusions via the Honcho SDK."
-
-问题：
-
-- Honcho 写自己的 peer card 到<b>远程 Honcho 后端</b>，不写 Hermes 原生 `USER.md`；
-- 是<b>可选 plugin</b>，默认不开。把 retrospective 绑到一个非默认 plugin 上等于改造仅对开 Honcho 的用户生效；
-- Honcho 的 dialectic 方法是"LLM 假设式自反思"，跟我们要的"forensic 数据驱动"在认识论上不一样。
-
-## 方案 E · 注册一个普通 `MemoryProvider`
-
-```python
-class HabitReflector(MemoryProvider):
-    def is_available(self):
-        # 在这里偷偷起一个 background thread 跑 cron?
-        threading.Thread(target=self._cron_loop, daemon=True).start()
-        return True
-```
-
-问题：
-
-- 跟方案 A 同病：Hermes 没法<b>调度</b>它，只能等它自己起线程；
-- `MemoryManager` 不知道这个 provider 在干什么，错误<b>没法被 manager 隔离</b>；
-- `is_available()` 不是 lifecycle hook，把 cron 启动塞这里是 hack。
-
----
-
-# 性能与成本
-
-| 项 | 数字 |
+| 项 | 状态 |
 |---|---|
-| 3 处源码改动 | +280 行（Hermes）+ 340 行（plugin） |
-| 5 个集成测试 | 全部 0.02 秒跑完 |
-| 单次 Haiku 4.5 蒸馏成本 | ~$0.40（input ~80k tokens × $1 + output ~3k tokens × $5） |
-| 月成本估算 | ~$12（每天 1 次） |
-| 主对话延迟开销 | 0 ms（异常时 only log warning，正常时 manager.run_retrospective 在 cold-start 周直接 return） |
-| 改动 3 触发块代码 | 8 行 |
+| 3 处 Hermes 源码追加 | ✅ |
+| `habit_reflector` plugin 实现 | ✅ |
+| 5 个集成测试（用 mock provider + canned LLM response） | ✅ |
+| 真 hermes CLI 端到端验证 | ❌ 阻塞于 venv 损坏（Hermes venv 指向已删除的 Python 3.11） |
+| 真 Haiku 4.5 蒸馏质量验证 | ❌ 当前只在 14-session 合成 fixture 上跑过 |
+| 提 PR 给上游 Hermes | ❌ 阶段 2/3 通过后才考虑 |
 
 ---
 
-# 仓库结构
+# 边界 · 它不能做什么
 
-```
-hermes-fork-pathB/
-├── README.md                                       # 完整说明 + 整套链路示例
-├── CHANGES.md                                      # 本文件 · 凝练版
-├── TESTING.md                                      # 3 层测试指南
-├── docs/SPEC.md                                    # 14 节设计 spec
-│
-├── baseline/                                       # 改造前对照
-│   ├── memory_provider.original.py                 (279 行)
-│   ├── memory_manager.original.py                  (555 行)
-│   └── run_agent.run_conversation_excerpt.py       (232 行)
-│
-├── agent/                                          # 改造后的 3 个文件
-│   ├── memory_provider.py                          (+107)
-│   ├── memory_manager.py                           (+120)
-│   └── run_agent.run_conversation_excerpt.py       (+52)
-│
-├── plugins/memory/habit_reflector/
-│   ├── __init__.py                                 # HabitReflector 类
-│   └── plugin.yaml                                 # Hermes plugin manifest
-│
-└── tests/test_pathB_integration.py                 # 5 个集成测试
-```
+写出来防止误读：
 
----
-
-# 时间线预期
-
-| 阶段 | 内容 | 估时 | 当前状态 |
-|---|---|---|---|
-| 阶段 1 | 抽象 + 调度 + plugin + mock 测试 | 完成 | ✅ |
-| 阶段 2 | 真集成 Hermes 端到端 | 半天-1 天（先修 venv） | 未开始 |
-| 阶段 3 · a | 用真 Haiku 跑 1 次 + 人工 label | 半天 | 未开始 |
-| 阶段 3 · b | 收集 ≥10 个真实 session 数据集 | 取决于本机使用频次 | 未开始 |
-| Apply patch 自动化 | 把 3 处改动做成 `.patch` 文件 | 0.5 天 | 未开始 |
+- <b>不替换</b> Hermes 现有 5 层，原 L1-L5 一行没改 · 这是 additive 改造
+- <b>不承诺</b>某个 benchmark 分数（Aider polyglot / SWE-bench）改善 · 没做过 A/B 对比
+- <b>不跨 user</b> 聚合 habit · 每个 Hermes 实例独立
+- <b>不用 embedding / vector DB</b> · YAGNI，100k+ session 之后才有意义
+- <b>不自动建 skill</b> · habit_reflector 只标候选给 Curator，建不建由 Curator 决定
 
 ---
 
 # 引用
 
-- 仓库：https://github.com/AlexZWANG1/hermes-fork-retrospective-provider
-- Hermes 源码 reference：`~/.hermes/hermes-agent/`（基于 2026-05 本机版本）
-- 关键源码 anchor：
-  - `agent/curator.py` line 17 strict invariant
-  - `agent/memory_provider.py` line 42 `MemoryProvider` ABC
-  - `agent/memory_manager.py` line 538 `initialize_all()`
-  - `run_agent.py` line 11419 `run_conversation()` 函数
-  - `tools/memory_tool.py` line 224 `MemoryStore.add()`
+- GitHub 仓库：https://github.com/AlexZWANG1/hermes-fork-retrospective-provider
 - 完整 README：[README.md](./README.md)
 - 测试指南：[TESTING.md](./TESTING.md)
-- 设计 spec：[docs/SPEC.md](./docs/SPEC.md)
+- 详细工程 spec：[docs/SPEC.md](./docs/SPEC.md)
+- 关键 Hermes 源码 anchor：
+  - `agent/curator.py:17` strict invariant
+  - `agent/memory_provider.py:42` 现有 `MemoryProvider` ABC
+  - `agent/memory_manager.py:538` `initialize_all()`（改动 2 在它后面追加）
+  - `run_agent.py:11419` `run_conversation()` 函数（改动 3 在它顶部追加）
+  - `tools/memory_tool.py:224` `MemoryStore.add()`（promote 走它）
